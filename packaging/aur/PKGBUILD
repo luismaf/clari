@@ -1,0 +1,27 @@
+# Maintainer: LuisMa <luismaf@gmail.com>
+pkgname=clari
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Claude Code quota guard: JSON statusLine hook + auto-resume over herdr"
+arch=('x86_64' 'aarch64')
+url="https://github.com/luismaf/clari"
+license=('MIT')
+depends=('glibc')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/luismaf/clari/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+# Requires the 'herdr' daemon running and the Claude Code statusLine hook
+# (clari auto-installs it into ~/.claude/settings.json on startup).
+# For the systemd user service: 'clari --install' (boot autorun,
+# login-less with loginctl enable-linger).
+
+build() {
+    cd "$srcdir/clari-$pkgver"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$srcdir/clari-$pkgver"
+    install -Dm755 target/release/clari "$pkgdir/usr/bin/clari"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

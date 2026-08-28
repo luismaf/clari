@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+            deb_arch: amd64
+          - os: ubuntu-24.04-arm
+            triple: aarch64-unknown-linux-gnu
+            deb_arch: arm64
+          # NOTE: no Intel (x86_64) macOS runner exists on GitHub anymore
+          # (macos-13 was retired): the installer falls back to
+          # `cargo install --git --tag` on Intel Macs.
+          - os: macos-14
+            triple: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/clari dist/clari
+          cp LICENSE dist/LICENSE
+          tar czf "dist/clari-${{ matrix.triple }}.tar.gz" -C dist clari LICENSE
+          rm -f dist/clari dist/LICENSE
+          if [ -n "${{ matrix.deb_arch }}" ]; then
+            bash scripts/build-deb.sh "${GITHUB_REF_NAME#v}" "${{ matrix.deb_arch }}" \
+              target/release/clari "dist/clari_${GITHUB_REF_NAME#v}_${{ matrix.deb_arch }}.deb"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
