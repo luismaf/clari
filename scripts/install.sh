@@ -107,6 +107,7 @@ install_binary() { # generic Linux/macOS (ARM): tar.gz into ~/.local/bin
                 command -v cargo >/dev/null 2>&1 || { echo "   cargo not found — install Rust first: https://rustup.rs" >&2; exit 1; }
                 [ "${CLARI_DRY_RUN:-0}" = "1" ] && { echo "-> (dry-run) would run: cargo install --git https://github.com/$REPO.git --tag $VERSION"; return 0; }
                 cargo install --git "https://github.com/$REPO.git" --tag "$VERSION"
+                INSTALLED_DIR="$HOME/.cargo/bin"
                 echo "-> done: ~/.cargo/bin/clari ($VERSION)"
                 return 0
                 ;;
@@ -125,6 +126,7 @@ install_binary() { # generic Linux/macOS (ARM): tar.gz into ~/.local/bin
     tar xzf "$TMP/clari.tar.gz" -C "$TMP"
     mkdir -p "$HOME/.local/bin"
     install -m755 "$TMP/clari" "$HOME/.local/bin/clari"
+    INSTALLED_DIR="$HOME/.local/bin"
     echo "-> done: ~/.local/bin/clari ($VERSION)"
 }
 
@@ -134,6 +136,7 @@ install_arch() { # the yay way, straight from this repo (no AUR needed)
     cd "$TMP/clari/packaging/aur"
     [ "${CLARI_DRY_RUN:-0}" = "1" ] && { echo "-> (dry-run) would run: makepkg -si"; return 0; }
     makepkg -si
+    INSTALLED_DIR="/usr/bin"
 }
 
 install_deb() { # Ubuntu/Debian: .deb via apt (resolves dependencies)
@@ -146,6 +149,7 @@ install_deb() { # Ubuntu/Debian: .deb via apt (resolves dependencies)
     curl -fsSL "https://github.com/$REPO/releases/download/$VERSION/$DEB" -o "$TMP/$DEB"
     [ "${CLARI_DRY_RUN:-0}" = "1" ] && { echo "-> (dry-run) would run: sudo apt-get install -y $TMP/$DEB"; return 0; }
     sudo_if apt-get install -y "$TMP/$DEB"
+    INSTALLED_DIR="/usr/bin"
 }
 
 install_windows() { # Windows (git-bash): build with Rust
@@ -168,6 +172,150 @@ case "$BRANCH" in
     linux) install_binary ;;
     *) echo "unsupported: $BRANCH" >&2; exit 1 ;;
 esac
+
+# ═══════════════════════════════════════════════════════════════════════
+# POST-INSTALL CHECKS
+# ═══════════════════════════════════════════════════════════════════════
+
+echo
+echo "── post-install checks ──"
+
+# ── 1. Detect conflicting copies ──────────────────────────────────────
+INSTALLED_BIN=""
+if [ -n "${INSTALLED_DIR:-}" ]; then
+    INSTALLED_BIN="$INSTALLED_DIR/clari"
+fi
+
+echo "-> checking PATH for conflicting copies..."
+CONFLICT_FOUND=0
+WHILE_IFS="$IFS"
+IFS=:
+for dir in $PATH; do
+    candidate="$dir/clari"
+    [ -z "$dir" ] && candidate="./clari"
+    if [ -x "$candidate" ]; then
+        REAL=$(readlink -f "$candidate" 2>/dev/null || echo "$candidate")
+        INSTALLED_REAL=""
+        if [ -n "$INSTALLED_BIN" ]; then
+            INSTALLED_REAL=$(readlink -f "$INSTALLED_BIN" 2>/dev/null || echo "$INSTALLED_BIN")
+        fi
+        if [ -n "$INSTALLED_REAL" ] && [ "$REAL" = "$INSTALLED_REAL" ]; then
+            echo "   ✓ $candidate -> $REAL (this is the one we installed)"
+        else
+            CONFLICT_VER=$("$candidate" --version 2>/dev/null | head -1 || echo "(unknown version)")
+            echo "   ⚠ CONFLICT: $candidate  [$CONFLICT_VER]"
+            echo "     This is NOT the version we just installed ($VERSION)."
+            CONFLICT_FOUND=1
+            if pacman -Qi clari &>/dev/null 2>&1; then
+                echo "     Detected: installed via pacman."
+                echo "     To fix:   sudo pacman -R clari"
+                echo "     Then re-run this install script."
+            elif dpkg -l clari 2>/dev/null | grep -q "^ii"; then
+                echo "     Detected: installed via dpkg/apt."
+                echo "     To fix:   sudo apt-get remove clari"
+                echo "     Then re-run this install script."
+            elif rpm -q clari &>/dev/null 2>&1; then
+                echo "     Detected: installed via rpm."
+                echo "     To fix:   sudo rpm -e clari"
+                echo "     Then re-run this install script."
+            else
+                echo "     Unknown package manager. Remove it manually, then re-run."
+            fi
+            echo "     The first copy in PATH wins — if $dir is before ${INSTALLED_DIR:-~/.local/bin},"
+            echo "     the old copy shadows the new one."
+        fi
+    fi
+done
+IFS="$WHILE_IFS"
+
+if [ "$CONFLICT_FOUND" -eq 1 ]; then
+    echo
+    echo "⚠  A conflicting clari was found. The one in PATH may not be $VERSION."
+    echo "   Fix the conflict above, then re-run this script."
+    echo
+fi
+
+# ── 2. Check PATH includes install dir ────────────────────────────────
+if [ -n "${INSTALLED_DIR:-}" ]; then
+    PATH_HAS_DIR=0
+    OLD_IFS="$IFS"
+    IFS=:
+    for dir in $PATH; do
+        [ "$dir" = "$INSTALLED_DIR" ] && { PATH_HAS_DIR=1; break; }
+    done
+    IFS="$OLD_IFS"
+
+    if [ "$PATH_HAS_DIR" -eq 0 ]; then
+        echo
+        echo "⚠  $INSTALLED_DIR is NOT in your PATH."
+        echo "   The binary is there, but your shell can't find it."
+        echo
+        SHELL_NAME=$(basename "${SHELL:-/bin/bash}")
+        RC_FILE=""
+        case "$SHELL_NAME" in
+            bash) RC_FILE="$HOME/.bashrc" ;;
+            zsh)  RC_FILE="$HOME/.zshrc" ;;
+            fish)
+                RC_FILE="$HOME/.config/fish/config.fish"
+                echo "   Add this line to $RC_FILE:"
+                echo "     fish_add_path $INSTALLED_DIR"
+                ;;
+            *) RC_FILE="$HOME/.profile" ;;
+        esac
+        if [ "$SHELL_NAME" != "fish" ] && [ -n "$RC_FILE" ]; then
+            LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
+            if [ "$INSTALLED_DIR" = "$HOME/.cargo/bin" ]; then
+                LINE="export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+            fi
+            echo "   Add this line to $RC_FILE:"
+            echo "     $LINE"
+            if [ -f "$RC_FILE" ] && ! grep -qF "$INSTALLED_DIR" "$RC_FILE" 2>/dev/null; then
+                echo "   Adding it now..."
+                echo "" >> "$RC_FILE"
+                echo "# clari ($VERSION installed $(date +%Y-%m-%d))" >> "$RC_FILE"
+                echo "$LINE" >> "$RC_FILE"
+                echo "   ✓ Added to $RC_FILE (restart your shell or run: source $RC_FILE)"
+            elif [ -f "$RC_FILE" ]; then
+                echo "   (already present in $RC_FILE — skipping)"
+            else
+                echo "   ($RC_FILE does not exist — create it or add the line manually)"
+            fi
+        fi
+    else
+        echo "✓ $INSTALLED_DIR is in PATH"
+    fi
+fi
+
+# ── 3. Verify binary works and version matches ────────────────────────
+echo
+echo "-> verifying clari works..."
+CLARI_BIN=$(command -v clari 2>/dev/null || echo "")
+if [ -z "$CLARI_BIN" ]; then
+    echo "⚠  'clari' not found in PATH after install."
+    echo "   The binary is at ${INSTALLED_BIN:-${INSTALLED_DIR:-~/.local/bin}/clari}"
+    echo "   You may need to restart your shell or fix PATH (see above)."
+else
+    if ! "$CLARI_BIN" -s >/dev/null 2>&1; then
+        echo "⚠  $CLARI_BIN exists but 'clari -s' failed."
+        echo "   Check dependencies or run with RUST_LOG=debug."
+    else
+        echo "✓ 'clari -s' works"
+    fi
+    INSTALLED_VER=$("$CLARI_BIN" --version 2>/dev/null | head -1 || echo "")
+    EXPECTED_VER="clari ${VERSION#v}"
+    if [ -n "$INSTALLED_VER" ] && [ -n "$EXPECTED_VER" ]; then
+        INSTALLED_CLEAN=$(echo "$INSTALLED_VER" | sed 's/-.*//')
+        EXPECTED_CLEAN=$(echo "$EXPECTED_VER" | sed 's/-.*//')
+        if [ "$INSTALLED_CLEAN" = "$EXPECTED_CLEAN" ]; then
+            echo "✓ version matches: $INSTALLED_VER"
+        else
+            echo "⚠  version mismatch!"
+            echo "   Installed binary reports: $INSTALLED_VER"
+            echo "   Expected:                $EXPECTED_VER"
+            echo "   The old copy may still be in PATH (see conflict check above)."
+        fi
+    fi
+fi
 
 echo
 echo "Try it:        clari -s"
