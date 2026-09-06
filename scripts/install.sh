@@ -68,12 +68,20 @@ VERSION="${CLARI_VERSION:-}"
 if [ -z "$VERSION" ]; then
     echo "-> fetching latest release..."
     VERSION="$(
-        curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+        curl -sSL "https://api.github.com/repos/$REPO/releases/latest" \
             | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[^"]*\)".*/\1/p' \
             | head -1
-    )"
+    )" || VERSION=""
 fi
-[ -n "$VERSION" ] || { echo "could not determine the latest version (no network?)" >&2; exit 1; }
+
+if [ -z "$VERSION" ]; then
+    echo "Error: Could not determine the latest version." >&2
+    echo "This can happen if there is no network connection, or if no releases have been published on GitHub yet." >&2
+    echo "To install from a specific version or branch, please run:" >&2
+    echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/master/scripts/install.sh | bash -s -- -v VERSION" >&2
+    exit 1
+fi
+
 VERSION="v${VERSION#v}"
 echo "-> clari $VERSION"
 
