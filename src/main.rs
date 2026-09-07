@@ -315,6 +315,17 @@ struct GuardState {
     /// are spaced out (the command is a toggle: never fire it twice fast).
     #[serde(default)]
     low_priority_attempts: HashMap<String, i64>,
+    /// Limit seen on an agent's OWN screen: target -> reset epoch parsed
+    /// from "… limit · resets 10am (tz)". Per agent because the hook JSON
+    /// only reflects the pane that rendered last (and its model), so a
+    /// weekly/opus limit hitting other panes never shows up there.
+    #[serde(default)]
+    screen_blocked: HashMap<String, i64>,
+    /// Last resume sent to an agent because of a screen-detected block
+    /// (epoch), to space retries when the reset passed but the agent is
+    /// still refused.
+    #[serde(default)]
+    screen_resume_attempts: HashMap<String, i64>,
 }
 
 // ─────────────────────────────────────────────
@@ -1033,6 +1044,14 @@ async fn run_once(
         return Ok(action);
     }
 
+    // 0b. Per-agent guard from the panes themselves: an agent that is not
+    //     working and shows "You've hit your … limit · resets 10am" is
+    //     blocked whatever the JSON says; it gets /low-priority now and a
+    //     resume once that reset passes.
+    if let Err(e) = screen_guard(config, state, now, &pause, dry_run).await {
+        warn!("Screen guard: {:#}", e);
+    }
+
     // 1. Hard limit: sleep and resume (all targets at the reset).
     //    Important: NEVER sleep through the warning window. If the hard
     //    limit is detected early (used>=99.9 with the window still far),
@@ -1337,7 +1356,27 @@ fn gather_rate_info(config: &Config) -> Result<RateInfo> {
         })
     });
     let now = Utc::now().timestamp();
-    let hard_limit_hit = used >= 99.9 || resets_at.is_some_and(|r| now >= r);
+    let mut hard_limit_hit = used >= 99.9 || resets_at.is_some_and(|r| now >= r);
+    let mut resets_at = resets_at;
+
+    // The weekly (seven_day) limit blocks exactly like the session one, and
+    // its reset is the window to wait for when it is the one exhausted.
+    let weekly_used = v
+        .pointer("/rate_limits/seven_day/used_percentage")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    let weekly_reset = v
+        .pointer("/rate_limits/seven_day/resets_at")
+        .and_then(|x| x.as_i64())
+        .map(|ts| if ts > 1_000_000_000_000 { ts / 1000 } else { ts });
+    if weekly_used >= 99.9 && config.forced_resets_at.is_none() {
+        if let Some(w) = weekly_reset {
+            if now < w {
+                hard_limit_hit = true;
+                resets_at = Some(w);
+            }
+        }
+    }
 
     Ok(RateInfo {
         used_pct: used,
@@ -1881,13 +1920,260 @@ fn classify_limit_screen(screen: &str) -> LimitScreen {
         // turn/subagent dies with ("You've hit your session limit · resets
         // 2:20am"): both mean the agent can't work until the reset.
         if line.contains("Usage limit reached")
-            || line.contains("You've hit your session limit")
-            || line.contains("You've hit your usage limit")
+            || (line.contains("You've hit your") && line.contains("limit"))
         {
             return LimitScreen::LimitReached;
         }
     }
     LimitScreen::Other
+}
+
+/// Parses the reset moment out of a limit line on screen, e.g.
+/// "You've hit your weekly limit · resets 10am (America/Argentina/Buenos_Aires)"
+/// or "Usage limit reached · resets 2:20am". Returns the epoch of that
+/// clock time: today's occurrence (even if already past — the text lingers
+/// on screen after the reset), tomorrow's when today's is more than 12h
+/// gone, or the named weekday's when one is given ("resets Tue 10am").
+fn parse_reset_from_screen(screen: &str, now: i64) -> Option<i64> {
+    use chrono::{Datelike, TimeZone, Timelike, Weekday};
+
+    let line = screen.lines().rev().map(str::trim).find(|l| {
+        l.contains("resets") && (l.contains("limit") || l.contains("Usage limit"))
+    })?;
+    let idx = line.find("resets")?;
+    let mut rest = line[idx + "resets".len()..].trim_start();
+    if let Some(r) = rest.strip_prefix("at ") {
+        rest = r.trim_start();
+    }
+    // optional weekday
+    let mut weekday: Option<Weekday> = None;
+    let first: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    if first.len() >= 3 {
+        weekday = first[..3].parse::<Weekday>().ok();
+        if weekday.is_some() {
+            rest = rest[first.len()..].trim_start().trim_start_matches(',').trim_start();
+        }
+    }
+    // time: H[:MM][ ]am|pm
+    let mut chars = rest.char_indices().peekable();
+    let mut hour_s = String::new();
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_ascii_digit() {
+            hour_s.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let mut hour: u32 = hour_s.parse().ok()?;
+    let mut minute: u32 = 0;
+    let mut pos = hour_s.len();
+    if rest[pos..].starts_with(':') {
+        let ms: String = rest[pos + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        minute = ms.parse().ok()?;
+        pos += 1 + ms.len();
+    }
+    let tail = rest[pos..].trim_start();
+    let lower = tail.to_ascii_lowercase();
+    let pm = if lower.starts_with("pm") || lower.starts_with("p.m") {
+        true
+    } else if lower.starts_with("am") || lower.starts_with("a.m") {
+        false
+    } else {
+        return None;
+    };
+    if hour > 12 || minute > 59 {
+        return None;
+    }
+    if pm && hour != 12 {
+        hour += 12;
+    }
+    if !pm && hour == 12 {
+        hour = 0;
+    }
+    // timezone in parentheses, else the machine's
+    let tz: Option<chrono_tz::Tz> = tail
+        .find('(')
+        .and_then(|a| tail[a + 1..].find(')').map(|b| tail[a + 1..a + 1 + b].trim().to_string()))
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok());
+
+    let to_epoch = |y: i32, m: u32, d: u32| -> Option<i64> {
+        match tz {
+            Some(z) => z
+                .with_ymd_and_hms(y, m, d, hour, minute, 0)
+                .single()
+                .map(|t| t.timestamp()),
+            None => Local
+                .with_ymd_and_hms(y, m, d, hour, minute, 0)
+                .single()
+                .map(|t| t.timestamp()),
+        }
+    };
+    let today = match tz {
+        Some(z) => {
+            let t = z.timestamp_opt(now, 0).single()?;
+            (t.year(), t.month(), t.day(), t.weekday(), t.hour())
+        }
+        None => {
+            let t = Local.timestamp_opt(now, 0).single()?;
+            (t.year(), t.month(), t.day(), t.weekday(), t.hour())
+        }
+    };
+    let base = chrono::NaiveDate::from_ymd_opt(today.0, today.1, today.2)?;
+    let mut candidate = to_epoch(base.year(), base.month(), base.day())?;
+    if let Some(wd) = weekday {
+        let mut days = (wd.num_days_from_monday() as i64 - today.3.num_days_from_monday() as i64)
+            .rem_euclid(7);
+        if days == 0 && candidate < now - 3600 {
+            days = 7;
+        }
+        let d = base + chrono::Duration::days(days);
+        candidate = to_epoch(d.year(), d.month(), d.day())?;
+    } else if candidate < now - 12 * 3600 {
+        let d = base + chrono::Duration::days(1);
+        candidate = to_epoch(d.year(), d.month(), d.day())?;
+    }
+    Some(candidate)
+}
+
+/// Spacing between resumes of an agent whose screen still shows the limit
+/// after the parsed reset passed (the text lingers, or it got refused
+/// again): don't hammer it.
+const SCREEN_RESUME_RETRY_SECS: i64 = 10 * 60;
+
+/// The per-agent guard. For every target that is NOT working, reads its
+/// screen; if it shows a limit, either sends /low-priority (reset still
+/// ahead) or resumes it (reset passed). Everything is keyed per agent and
+/// per parsed reset so it never loops on the same window.
+async fn screen_guard(
+    config: &Config,
+    state: &mut GuardState,
+    now: i64,
+    pause: &PauseState,
+    dry_run: bool,
+) -> Result<()> {
+    let targets: Vec<Target> = resolve_wake_targets(config)
+        .await?
+        .into_iter()
+        .filter(|t| !t.is_paused(pause))
+        .collect();
+    let margin = config.safety_margin_secs as i64;
+    let cmd = config.low_priority_command.trim();
+    let mut changed = false;
+
+    for t in &targets {
+        let key = t.key();
+        match get_agent_status(config, t).await {
+            Ok(s) if s == "working" => {
+                if state.screen_blocked.remove(&key).is_some() {
+                    changed = true;
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                debug!("'{}': status unknown ({:#}) — reading the screen anyway", t, e);
+            }
+        }
+        let screen = match read_agent_screen(config, t).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Could not read the screen of '{}': {:#}", t, e);
+                continue;
+            }
+        };
+        let class = classify_limit_screen(&screen);
+        if class == LimitScreen::Other || class == LimitScreen::LowPriorityActive {
+            if state.screen_blocked.remove(&key).is_some() {
+                changed = true;
+            }
+            continue;
+        }
+        let reset = parse_reset_from_screen(&screen, now);
+        let blocked_ahead = reset.is_some_and(|r| now < r + margin) && class != LimitScreen::LimitReset;
+
+        if blocked_ahead {
+            let r = reset.unwrap_or(0);
+            if state.screen_blocked.get(&key) != Some(&r) {
+                info!(
+                    "'{}' shows a limit on its screen: blocked until {} (parsed from the pane)",
+                    t, r
+                );
+                state.screen_blocked.insert(key.clone(), r);
+                changed = true;
+            }
+            // Keep it working at lower priority meanwhile (same dedup and
+            // spacing as the JSON-driven pass; the toggle is never sent
+            // blind and the screen is re-read next poll).
+            if config.low_priority
+                && class == LimitScreen::LimitReached
+                && state.low_priority_targets.get(&key) != Some(&r)
+            {
+                if let Some(last) = state.low_priority_attempts.get(&key) {
+                    if now - last < LOW_PRIORITY_RETRY_SECS {
+                        continue;
+                    }
+                }
+                info!(
+                    "'{}' is stuck on its limit screen → sending {} so it keeps working at lower priority",
+                    t, cmd
+                );
+                state.low_priority_attempts.insert(key.clone(), now);
+                changed = true;
+                if dry_run {
+                    info!("[rehearsal] would send {} to '{}'", cmd, t);
+                } else if let Err(e) = send_to_herdr(config, t, cmd, None, None).await {
+                    warn!("'{}': sending {} failed: {:#} — will retry", t, cmd, e);
+                }
+            } else if class == LimitScreen::LowPriorityUnavailable
+                && state.low_priority_targets.get(&key) != Some(&r)
+            {
+                warn!(
+                    "'{}': lower-priority mode is not available for this block — it waits for the reset at {}",
+                    t, r
+                );
+                state.low_priority_targets.insert(key.clone(), r);
+                changed = true;
+            }
+            continue;
+        }
+
+        // The reset passed (or the screen says it did): wake it up, spaced.
+        if let Some(last) = state.screen_resume_attempts.get(&key) {
+            if now - last < SCREEN_RESUME_RETRY_SECS {
+                continue;
+            }
+        }
+        info!(
+            "'{}' is idle on a limit screen whose reset ({}) passed → resuming",
+            t,
+            reset.map(|r| r.to_string()).unwrap_or_else(|| "unknown".into())
+        );
+        state.screen_resume_attempts.insert(key.clone(), now);
+        state.screen_blocked.remove(&key);
+        // Give the resume a minute before any /low-priority is considered
+        // for this agent: the old limit line is still on screen right now.
+        state.low_priority_attempts.insert(key.clone(), now);
+        changed = true;
+        if dry_run {
+            info!("[rehearsal] would send resume to '{}'", t);
+            continue;
+        }
+        let msg = effective_resume_message(config);
+        match wake_agent(config, t, &msg).await {
+            Ok(true) => {}
+            Ok(false) => warn!("'{}' did not turn working after the resume — retry in {}s", t, SCREEN_RESUME_RETRY_SECS),
+            Err(e) => warn!("'{}': resume failed: {:#}", t, e),
+        }
+    }
+
+    if changed {
+        save_state(&config.state_path, state)?;
+    }
+    Ok(())
 }
 
 /// Minimum spacing between two `/low-priority` sends to the same agent:
@@ -3167,6 +3453,24 @@ async fn print_full_status(config: &Config) -> Result<()> {
             )
         }
     );
+    {
+        let st = load_state(&config.state_path).unwrap_or_default();
+        if !st.screen_blocked.is_empty() {
+            let mut b: Vec<_> = st.screen_blocked.iter().collect();
+            b.sort();
+            println!(
+                "{:<15}: {}",
+                "screen_blocked",
+                painted(
+                    &b.iter()
+                        .map(|(k, r)| format!("{k} until {r}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    YELLOW
+                )
+            );
+        }
+    }
     match resolve_targets(config).await {
         Ok(targets) => {
             println!(
@@ -3457,6 +3761,8 @@ mod tests {
         assert_eq!(classify_limit_screen(gone), LimitScreen::LimitReached);
         let gone_last = "  ⎿  You've hit your session limit · resets 2:20am\n● You've used this week's lower-priority allowance · lower-priority mode ended\n";
         assert_eq!(classify_limit_screen(gone_last), LimitScreen::LowPriorityUnavailable);
+        let weekly = "  ⎿  You've hit your weekly limit · resets 10am (America/Argentina/Buenos_Aires)\n     /upgrade to increase your usage limit.\n❯ \n";
+        assert_eq!(classify_limit_screen(weekly), LimitScreen::LimitReached);
     }
 
     #[test]
@@ -3465,6 +3771,42 @@ mod tests {
         assert_eq!(s.blocked_reset_at, None);
         let s: GuardState = serde_json::from_str(r#"{"blocked_reset_at": 1788758400}"#).unwrap();
         assert_eq!(s.blocked_reset_at, Some(1788758400));
+    }
+
+    #[test]
+    fn parses_reset_time_from_the_pane() {
+        use chrono::TimeZone;
+        let tz: chrono_tz::Tz = "America/Argentina/Buenos_Aires".parse().unwrap();
+        // now = 2026-09-07 11:24 local
+        let now = tz.with_ymd_and_hms(2026, 9, 7, 11, 24, 0).unwrap().timestamp();
+        let screen = "  ⎿  You've hit your weekly limit · resets 10am (America/Argentina/Buenos_Aires)\n     /upgrade to increase your usage limit.\n❯ \n";
+        let r = parse_reset_from_screen(screen, now).unwrap();
+        assert_eq!(r, tz.with_ymd_and_hms(2026, 9, 7, 10, 0, 0).unwrap().timestamp(), "today 10am, already past");
+        let s2 = "Usage limit reached · resets 2:20pm (America/Argentina/Buenos_Aires) · /low-priority to continue\n";
+        assert_eq!(parse_reset_from_screen(s2, now).unwrap(), tz.with_ymd_and_hms(2026, 9, 7, 14, 20, 0).unwrap().timestamp());
+        // 23:00 with "resets 2:20am" → tomorrow
+        let late = tz.with_ymd_and_hms(2026, 9, 7, 23, 0, 0).unwrap().timestamp();
+        let s3 = "You've hit your session limit · resets 2:20am (America/Argentina/Buenos_Aires)";
+        assert_eq!(parse_reset_from_screen(s3, late).unwrap(), tz.with_ymd_and_hms(2026, 9, 8, 2, 20, 0).unwrap().timestamp());
+        // weekday form
+        let s4 = "You've hit your weekly limit · resets Wed 10am (America/Argentina/Buenos_Aires)";
+        assert_eq!(parse_reset_from_screen(s4, now).unwrap(), tz.with_ymd_and_hms(2026, 9, 9, 10, 0, 0).unwrap().timestamp());
+        assert_eq!(parse_reset_from_screen("nothing here", now), None);
+    }
+
+    #[test]
+    fn weekly_limit_in_the_json_blocks_with_its_own_reset() {
+        let dir = std::env::temp_dir().join(format!("clari-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("statusline.json");
+        let now = Utc::now().timestamp();
+        fs::write(&f, format!(r#"{{"rate_limits":{{"five_hour":{{"used_percentage":60,"resets_at":{}}},"seven_day":{{"used_percentage":100,"resets_at":{}}}}}}}"#, now + 5000, now + 90000)).unwrap();
+        let cfg = Config { statusline_json_path: f.clone(), ..Config::default() };
+        let info = gather_rate_info(&cfg).unwrap();
+        assert!(info.hard_limit_hit);
+        assert_eq!(info.resets_at, Some(now + 90000));
+        assert_eq!(info.used_pct, 60.0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

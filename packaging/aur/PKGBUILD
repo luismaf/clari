@@ -1,6 +1,6 @@
 # Maintainer: LuisMa <luismaf@gmail.com>
 pkgname=clari
-pkgver=0.6.3
+pkgver=0.6.4
 pkgrel=1
 pkgdesc="Claude Code quota guard: JSON statusLine hook + auto-resume over herdr"
 arch=('x86_64' 'aarch64')
