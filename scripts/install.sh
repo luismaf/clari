@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-liner install for clari:
 #   curl -fsSL https://raw.githubusercontent.com/luismaf/clari/master/scripts/install.sh | bash
-#   pin a release:  ... | bash -s -- -v 0.6.5      (or: bash -s 0.6.5)
+#   pin a release:  ... | bash -s -- -v 0.6.6      (or: bash -s 0.6.6)
 #
 # Detects your system and picks the right method:
 #   Ubuntu/Debian : .deb package via apt
@@ -17,11 +17,11 @@
 # It never touches your services or config: run 'clari' (or 'clari --install')
 # afterwards if you want the systemd user service (boot autorun).
 #
-# Env overrides (handy for testing): CLARI_VERSION=v0.6.5 to pin a release,
+# Env overrides (handy for testing): CLARI_VERSION=v0.6.6 to pin a release,
 # CLARI_FORCE=arch|deb|mac|windows|linux|source to force a branch,
 # CLARI_DRY_RUN=1 to only print what would happen, CLARI_REF=<branch|sha>
 # to build a specific git ref from source. CLI: '-v VERSION' or bare
-# VERSION pins a release, e.g.  curl -fsSL <url> | bash -s -- -v 0.6.5
+# VERSION pins a release, e.g.  curl -fsSL <url> | bash -s -- -v 0.6.6
 set -euo pipefail
 
 usage() {
@@ -51,7 +51,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         -v|--version)
-            [ $# -ge 2 ] || { echo "option $1 needs a value (e.g. -v 0.6.5)" >&2; exit 1; }
+            [ $# -ge 2 ] || { echo "option $1 needs a value (e.g. -v 0.6.6)" >&2; exit 1; }
             CLARI_VERSION="$2"
             shift 2
             ;;

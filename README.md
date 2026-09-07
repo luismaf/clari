@@ -76,6 +76,7 @@ Use `null` to clear any optional value.
 | --- | --- | --- |
 | `-d[=MSG]` / `-n` | `delegation` (`delegation_prompt`) | `false` |
 | `-L` / `--no-low-priority` | `low_priority` (`low_priority_command`) | `true` (`/low-priority`) |
+| `--screen-scan <secs>` | `screen_scan_interval_secs` | `600` (pane reads every 10 min) |
 | `-t <name>` | `herdr_agent_target` | all `claude` agents |
 | `-a` / `-o` | `resume_all` | `true` |
 | `-p <pct>` / `--threshold` | `threshold_pct` | `90` |

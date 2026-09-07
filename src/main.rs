@@ -120,6 +120,11 @@ struct Config {
     /// Slash command sent to a blocked agent (default "/low-priority").
     #[serde(default = "default_low_priority_command")]
     low_priority_command: String,
+    /// Seconds between two rounds of pane screen reads (the per-agent
+    /// limit guard and the /low-priority sends). Reading every pane is the
+    /// costly part, and these cases can wait: default 600 (10 min).
+    #[serde(default = "default_screen_scan")]
+    screen_scan_interval_secs: u64,
 }
 
 fn default_threshold() -> f64 {
@@ -148,6 +153,9 @@ fn default_resume_msg() -> String {
 }
 fn default_low_priority_command() -> String {
     "/low-priority".into()
+}
+fn default_screen_scan() -> u64 {
+    600
 }
 fn default_state_path() -> PathBuf {
     dirs::home_dir()
@@ -246,6 +254,7 @@ impl Default for Config {
             claude_settings_path: None,
             low_priority: default_true(),
             low_priority_command: default_low_priority_command(),
+            screen_scan_interval_secs: default_screen_scan(),
         }
     }
 }
@@ -326,6 +335,9 @@ struct GuardState {
     /// still refused.
     #[serde(default)]
     screen_resume_attempts: HashMap<String, i64>,
+    /// When the panes were last read (not persisted: a restart scans at once).
+    #[serde(skip)]
+    last_screen_scan: i64,
 }
 
 // ─────────────────────────────────────────────
@@ -514,6 +526,10 @@ struct Cli {
     /// Don't send /low-priority: blocked agents wait for the reset.
     #[arg(long = "no-low-priority")]
     no_low_priority: bool,
+
+    /// Seconds between two rounds of pane screen reads (default 600).
+    #[arg(long = "screen-scan", value_name = "SECS")]
+    screen_scan: Option<u64>,
 
     /// statusLine hook for Claude Code: receives JSON on stdin and stores
     /// it in statusline_json_path (the guard reads it afterwards).
@@ -1048,8 +1064,15 @@ async fn run_once(
     //     working and shows "You've hit your … limit · resets 10am" is
     //     blocked whatever the JSON says; it gets /low-priority now and a
     //     resume once that reset passes.
-    if let Err(e) = screen_guard(config, state, now, &pause, dry_run).await {
-        warn!("Screen guard: {:#}", e);
+    //     Screens are read at most every `screen_scan_interval_secs`
+    //     (shared with the /low-priority pass below): it is the expensive
+    //     part and these cases can wait a few minutes.
+    let screen_due = now - state.last_screen_scan >= config.screen_scan_interval_secs as i64;
+    if screen_due {
+        state.last_screen_scan = now;
+        if let Err(e) = screen_guard(config, state, now, &pause, dry_run).await {
+            warn!("Screen guard: {:#}", e);
+        }
     }
 
     // 1. Hard limit: sleep and resume (all targets at the reset).
@@ -1116,7 +1139,7 @@ async fn run_once(
             // Every claude agent sitting on the "Usage limit reached"
             // screen gets /low-priority so it keeps working right now at
             // lower priority; the ones already in that mode are left alone.
-            if config.low_priority {
+            if config.low_priority && screen_due {
                 if let Err(e) = low_priority_pass(config, state, reset_at, &pause, dry_run).await {
                     warn!("Low-priority pass: {:#}", e);
                 }
@@ -2623,6 +2646,12 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
     if cli.no_low_priority {
         s.push(("low_priority".into(), Some(toml::Value::Boolean(false))));
     }
+    if let Some(v) = cli.screen_scan {
+        s.push((
+            "screen_scan_interval_secs".into(),
+            Some(toml::Value::Integer(v as i64)),
+        ));
+    }
     if let Some(v) = cli.poll {
         s.push((
             "poll_interval_secs".into(),
@@ -3869,6 +3898,10 @@ mod tests {
         let cli = Cli::parse_from(["clari", "--no-low-priority"]);
         let s = collect_settings(&cli).unwrap();
         assert_eq!(s, vec![("low_priority".to_string(), Some(toml::Value::Boolean(false)))]);
+        let cli = Cli::parse_from(["clari", "--screen-scan", "300"]);
+        let s = collect_settings(&cli).unwrap();
+        assert_eq!(s, vec![("screen_scan_interval_secs".to_string(), Some(toml::Value::Integer(300)))]);
+        assert_eq!(Config::default().screen_scan_interval_secs, 600);
         let cli = Cli::parse_from(["clari", "-L"]);
         let s = collect_settings(&cli).unwrap();
         assert_eq!(s, vec![("low_priority".to_string(), Some(toml::Value::Boolean(true)))]);
