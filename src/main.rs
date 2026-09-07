@@ -286,6 +286,14 @@ const RESUME_DELEGATION_NOTICE: &str =
 struct GuardState {
     last_injected_reset_at: Option<i64>,
     last_hard_limit_reset_at: Option<i64>,
+    /// The window (resets_at) the fleet is blocked on. Recorded the moment
+    /// the hard limit is seen and cleared only once every agent has been
+    /// resumed after the reset. The resume is driven by THIS field and the
+    /// clock, never by the hook JSON: the JSON flips to 0% the instant the
+    /// window opens (any pane render refreshes it), so "still blocked at
+    /// reset + margin" is not a signal that can be waited for.
+    #[serde(default)]
+    blocked_reset_at: Option<i64>,
     /// Window for which we already warned that resets_at went stale
     /// (avoids repeating the warning every poll).
     warned_stale_reset_at: Option<i64>,
@@ -929,25 +937,6 @@ async fn main() -> Result<()> {
                 // Always a 2s floor on any loop.
                 sleep(Duration::from_secs(secs.max(2))).await;
             }
-            Ok(Action::SleepUntil(reset_at)) => {
-                let wait = wait_duration(reset_at, config.safety_margin_secs);
-                info!(
-                    "Hard limit detected. Sleeping until reset + margin (~{}s)...",
-                    wait.as_secs()
-                );
-                sleep(wait).await;
-
-                state.last_hard_limit_reset_at = Some(reset_at);
-                save_state(&config.state_path, &state)?;
-                match resume_targets(&config, &mut state, reset_at, dry_run).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // Targets that didn't get marked are retried on the
-                        // next cycle (run_once detects pending targets).
-                        warn!("Multi-target resume incomplete: {:#}", e);
-                    }
-                }
-            }
             Err(e) => {
                 warn!("Error in cycle: {:#}", e);
                 sleep(Duration::from_secs(config.poll_interval_secs)).await;
@@ -958,8 +947,65 @@ async fn main() -> Result<()> {
 
 enum Action {
     Continue,
-    SleepUntil(i64),
     SleepSeconds(u64),
+}
+
+/// How long after the reset the resume keeps being retried for agents that
+/// did not turn `working` (send failed, stale screen). Generous on purpose:
+/// a daemon (re)started hours after the reset must still wake the fleet.
+const RESUME_RETRY_WINDOW_SECS: i64 = 3 * 3600;
+
+/// Wakes the fleet for the window recorded in `blocked_reset_at` once the
+/// clock says reset + margin has passed — whatever the hook JSON shows.
+/// Returns Some(action) when it acted this cycle.
+async fn pending_resume(
+    config: &Config,
+    state: &mut GuardState,
+    now: i64,
+    dry_run: bool,
+) -> Result<Option<Action>> {
+    let Some(reset_at) = state.blocked_reset_at else {
+        return Ok(None);
+    };
+    if now < reset_at + config.safety_margin_secs as i64 {
+        return Ok(None);
+    }
+    if now - reset_at > RESUME_RETRY_WINDOW_SECS {
+        warn!(
+            "Window {} reset {}s ago and some agent never turned working: giving up on it",
+            reset_at,
+            now - reset_at
+        );
+        state.blocked_reset_at = None;
+        state.last_hard_limit_reset_at = Some(reset_at);
+        save_state(&config.state_path, state)?;
+        return Ok(None);
+    }
+    if state.last_hard_limit_reset_at != Some(reset_at) {
+        info!(
+            "Window {} opened ({}s ago): resuming every agent that is still waiting",
+            reset_at,
+            now - reset_at
+        );
+        state.last_hard_limit_reset_at = Some(reset_at);
+        save_state(&config.state_path, state)?;
+    }
+    match resume_targets(config, state, reset_at, dry_run).await {
+        Ok(true) => {
+            info!("Every agent is resumed for window {}", reset_at);
+            state.blocked_reset_at = None;
+            save_state(&config.state_path, state)?;
+            Ok(Some(Action::Continue))
+        }
+        Ok(false) => {
+            debug!("Resume still pending for some target of window {}", reset_at);
+            Ok(Some(Action::SleepSeconds(config.poll_interval_secs.max(5))))
+        }
+        Err(e) => {
+            warn!("Resume of window {} incomplete: {:#} — retrying next cycle", reset_at, e);
+            Ok(Some(Action::SleepSeconds(config.poll_interval_secs.max(5))))
+        }
+    }
 }
 
 async fn run_once(
@@ -980,6 +1026,13 @@ async fn run_once(
         info.used_pct, info.resets_at, info.hard_limit_hit
     );
 
+    // 0. A window we were blocked on has opened: wake the fleet. This runs
+    //    first and on the clock alone, because the hook JSON already shows
+    //    the fresh window by now and would never say "blocked" again.
+    if let Some(action) = pending_resume(config, state, now, dry_run).await? {
+        return Ok(action);
+    }
+
     // 1. Hard limit: sleep and resume (all targets at the reset).
     //    Important: NEVER sleep through the warning window. If the hard
     //    limit is detected early (used>=99.9 with the window still far),
@@ -989,28 +1042,9 @@ async fn run_once(
     if info.hard_limit_hit {
         if let Some(reset_at) = info.resets_at {
             if state.last_hard_limit_reset_at == Some(reset_at) {
-                // Window already processed: if any target is still stuck
-                // (a send failed or the agent didn't turn working), retry
-                // on the next cycle.
-                match resolve_wake_targets(config).await {
-                    Ok(all_targets) => {
-                        let targets: Vec<Target> = all_targets
-                            .into_iter()
-                            .filter(|t| !t.is_paused(&pause))
-                            .collect();
-                        let pending = targets
-                            .iter()
-                            .any(|t| state.woken_targets.get(&t.key()) != Some(&reset_at));
-                        if pending {
-                            debug!("Resume still pending for targets of this window");
-                            return Ok(Action::SleepUntil(reset_at));
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Could not list targets to retry resume: {:#}", e)
-                    }
-                }
-
+                // Window already resumed (targets still pending are retried
+                // by pending_resume above while blocked_reset_at is set).
+                //
                 // If way past the reset and resets_at stayed the same,
                 // the hook JSON is stale (or the window moved):
                 // warn ONCE per window and keep polling.
@@ -1028,11 +1062,21 @@ async fn run_once(
                 }
                 return Ok(Action::Continue);
             }
-            // NEW window in hard limit.
+            // NEW window in hard limit: remember it, the resume is driven
+            // by the clock from here on (see pending_resume).
+            if state.blocked_reset_at != Some(reset_at) {
+                state.blocked_reset_at = Some(reset_at);
+                save_state(&config.state_path, state)?;
+                info!(
+                    "Hard limit: fleet blocked until {} (+{}s margin); every agent \
+                     still waiting will be resumed then",
+                    reset_at, config.safety_margin_secs
+                );
+            }
             let remaining = reset_at - now;
             if now >= reset_at + (config.safety_margin_secs as i64) {
-                // The reset already passed (+margin): time to wake up (the
-                // main loop sends the resumes with verification).
+                // The reset already passed (+margin) but the JSON is stale:
+                // wake up right now.
                 if config.delegation
                     && state
                         .last_injected_reset_at
@@ -1045,7 +1089,9 @@ async fn run_once(
                          running and the poll interval was small enough."
                     );
                 }
-                return Ok(Action::SleepUntil(reset_at));
+                return Ok(pending_resume(config, state, now, dry_run)
+                    .await?
+                    .unwrap_or(Action::Continue));
             }
             // Still inside the blocked window: don't let the fleet freeze.
             // Every claude agent sitting on the "Usage limit reached"
@@ -1831,7 +1877,13 @@ fn classify_limit_screen(screen: &str) -> LimitScreen {
         if line.contains("Your usage limit has reset") {
             return LimitScreen::LimitReset;
         }
-        if line.contains("Usage limit reached") {
+        // The pinned banner ("Usage limit reached") or the API error a
+        // turn/subagent dies with ("You've hit your session limit · resets
+        // 2:20am"): both mean the agent can't work until the reset.
+        if line.contains("Usage limit reached")
+            || line.contains("You've hit your session limit")
+            || line.contains("You've hit your usage limit")
+        {
             return LimitScreen::LimitReached;
         }
     }
@@ -1969,11 +2021,11 @@ async fn resume_targets(
     state: &mut GuardState,
     reset_at: i64,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<bool> {
     // Budget enforcement: refuse to wake agents if max_devs is reached.
     if let Err(e) = check_max_devs(config, "resume").await {
         warn!("Resume blocked by budget: {:#}", e);
-        return Ok(()); // skip this cycle, retry on next poll
+        return Ok(false); // skip this cycle, retry on next poll
     }
 
     let pause = load_pause_state(&pause_path());
@@ -2009,7 +2061,9 @@ async fn resume_targets(
     }
 
     save_state(&config.state_path, state)?;
-    Ok(())
+    Ok(targets
+        .iter()
+        .all(|t| state.woken_targets.get(&t.key()) == Some(&reset_at)))
 }
 
 /// Sends the resume to an agent and VERIFIES it actually started:
@@ -2661,11 +2715,6 @@ fn run_hook_install(config: &Config, dry_run: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn wait_duration(reset_at: i64, margin_secs: u64) -> Duration {
-    let target = reset_at + margin_secs as i64;
-    Duration::from_secs((target - Utc::now().timestamp()).max(5) as u64)
 }
 
 // ─────────────────────────────────────────────
@@ -3395,6 +3444,25 @@ mod tests {
         ] {
             assert_eq!(classify_limit_screen(s), LimitScreen::LowPriorityUnavailable, "{s}");
         }
+    }
+
+    #[test]
+    fn limit_screen_api_error_wording_is_the_limit_too() {
+        let screen = "● Agent \"x\" failed: Agent terminated early due to an API error: You've hit your session limit · resets 2:20am (America/Argentina/Buenos_Aires)\n  ⎿  You've hit your session limit · resets 2:20am\n     /upgrade to increase your usage limit.\n❯ \n";
+        assert_eq!(classify_limit_screen(screen), LimitScreen::LimitReached);
+        // ...unless the allowance is gone: then the LAST word is "unavailable".
+        let gone = "● You've used this week's lower-priority allowance · lower-priority mode ended; it is offered again after your weekly limit resets\n  ⎿  You've hit your session limit · resets 2:20am\n";
+        assert_eq!(classify_limit_screen(gone), LimitScreen::LimitReached);
+        let gone_last = "  ⎿  You've hit your session limit · resets 2:20am\n● You've used this week's lower-priority allowance · lower-priority mode ended\n";
+        assert_eq!(classify_limit_screen(gone_last), LimitScreen::LowPriorityUnavailable);
+    }
+
+    #[test]
+    fn pending_resume_state_roundtrip_and_default() {
+        let s: GuardState = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.blocked_reset_at, None);
+        let s: GuardState = serde_json::from_str(r#"{"blocked_reset_at": 1788758400}"#).unwrap();
+        assert_eq!(s.blocked_reset_at, Some(1788758400));
     }
 
     #[test]
