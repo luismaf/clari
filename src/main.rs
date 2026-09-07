@@ -1919,8 +1919,10 @@ fn classify_limit_screen(screen: &str) -> LimitScreen {
         // The pinned banner ("Usage limit reached") or the API error a
         // turn/subagent dies with ("You've hit your session limit · resets
         // 2:20am"): both mean the agent can't work until the reset.
+        // ...or Claude Code's own pinned offer of the command.
         if line.contains("Usage limit reached")
             || (line.contains("You've hit your") && line.contains("limit"))
+            || line.contains("to continue now at lower priority")
         {
             return LimitScreen::LimitReached;
         }
@@ -3763,6 +3765,8 @@ mod tests {
         assert_eq!(classify_limit_screen(gone_last), LimitScreen::LowPriorityUnavailable);
         let weekly = "  ⎿  You've hit your weekly limit · resets 10am (America/Argentina/Buenos_Aires)\n     /upgrade to increase your usage limit.\n❯ \n";
         assert_eq!(classify_limit_screen(weekly), LimitScreen::LimitReached);
+        let offer = "❯ \n  ⚠ /low-priority to continue now at lower priority · uses your weekly limit\n  ⏵⏵ auto mode on\n";
+        assert_eq!(classify_limit_screen(offer), LimitScreen::LimitReached);
     }
 
     #[test]
