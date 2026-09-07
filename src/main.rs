@@ -1995,7 +1995,9 @@ async fn low_priority_pass(
                     info!("[rehearsal] would send {} to '{}'", cmd, t);
                     continue;
                 }
-                match send_to_herdr(config, t, cmd, None, Some(15_000)).await {
+                // Fire and forget (no --wait: herdr's --timeout needs it and the
+                // toggle is verified by re-reading the screen next pass anyway).
+                match send_to_herdr(config, t, cmd, None, None).await {
                     Ok(_) => info!("'{}': {} sent — verifying on the next pass", t, cmd),
                     Err(e) => warn!("'{}': sending {} failed: {:#} — will retry", t, cmd, e),
                 }
