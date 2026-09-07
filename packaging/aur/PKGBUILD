@@ -1,6 +1,6 @@
 # Maintainer: LuisMa <luismaf@gmail.com>
 pkgname=clari
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc="Claude Code quota guard: JSON statusLine hook + auto-resume over herdr"
 arch=('x86_64' 'aarch64')
@@ -17,11 +17,16 @@ sha256sums=('SKIP')
 
 build() {
     cd "$srcdir/clari-$pkgver"
+    # Pin the target dir (Arch Rust guidelines): a user-wide CARGO_TARGET_DIR
+    # (~/.cargo/target, makepkg.conf, env) would otherwise put the binary
+    # outside $srcdir and package() would not find it.
+    export CARGO_TARGET_DIR=target
     cargo build --release --locked
 }
 
 package() {
     cd "$srcdir/clari-$pkgver"
+    export CARGO_TARGET_DIR=target
     install -Dm755 target/release/clari "$pkgdir/usr/bin/clari"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
