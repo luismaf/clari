@@ -60,8 +60,9 @@ struct Config {
     /// herdr binary to invoke (in case it isn't on PATH with that exact name).
     #[serde(default = "default_herdr_bin")]
     herdr_bin: String,
-    /// Named herdr session, if any (passed as HERDR_SESSION).
-    /// Leave as None to use the default session.
+    /// Pin ONE named herdr session (passed as HERDR_SESSION). None
+    /// (default) = EVERY running herdr session (`herdr session list`) is
+    /// watched, so a limit wakes the whole fleet, not just one session.
     herdr_session: Option<String>,
     /// The agent kind we look for with `herdr agent list` when there is
     /// no explicit target (see herdr_agent_target). See `herdr agent start --help`
@@ -107,6 +108,18 @@ struct Config {
     /// Path of the user Claude Code settings.json. Default:
     /// $CLAUDE_CONFIG_DIR/settings.json o ~/.claude/settings.json.
     claude_settings_path: Option<PathBuf>,
+
+    /// If true (default), the moment the hard limit hits, every claude
+    /// agent stuck on Claude Code's "Usage limit reached" screen gets the
+    /// `/low-priority` command, so it keeps working in the background at
+    /// lower priority instead of freezing until the reset. The screen is
+    /// read first (never sent blind: the command is a toggle) and the
+    /// result is verified on the next poll. Off with --no-low-priority.
+    #[serde(default = "default_true")]
+    low_priority: bool,
+    /// Slash command sent to a blocked agent (default "/low-priority").
+    #[serde(default = "default_low_priority_command")]
+    low_priority_command: String,
 }
 
 fn default_threshold() -> f64 {
@@ -132,6 +145,9 @@ fn default_delegation_prompt() -> String {
 }
 fn default_resume_msg() -> String {
     "continue".into()
+}
+fn default_low_priority_command() -> String {
+    "/low-priority".into()
 }
 fn default_state_path() -> PathBuf {
     dirs::home_dir()
@@ -228,6 +244,8 @@ impl Default for Config {
             statusline_json_path: default_statusline_path(),
             install_statusline_hook: default_true(),
             claude_settings_path: None,
+            low_priority: default_true(),
+            low_priority_command: default_low_priority_command(),
         }
     }
 }
@@ -280,6 +298,15 @@ struct GuardState {
     /// injection is retried without spamming the ones that succeeded).
     #[serde(default)]
     injected_targets: HashMap<String, i64>,
+    /// `/low-priority` handled per agent: target -> resets_at of the
+    /// window in which the agent was switched to (or found already in)
+    /// lower-priority mode, or in which the mode turned out unavailable.
+    #[serde(default)]
+    low_priority_targets: HashMap<String, i64>,
+    /// Last time (epoch secs) the command was sent per agent, so retries
+    /// are spaced out (the command is a toggle: never fire it twice fast).
+    #[serde(default)]
+    low_priority_attempts: HashMap<String, i64>,
 }
 
 // ─────────────────────────────────────────────
@@ -459,6 +486,16 @@ struct Cli {
     #[arg(short = 'o', long)]
     no_all: bool,
 
+    /// When the limit hits, send /low-priority to every claude agent stuck
+    /// on the "Usage limit reached" screen so it keeps working at lower
+    /// priority (default: on; writes to the config file).
+    #[arg(short = 'L', long = "low-priority")]
+    low_priority: bool,
+
+    /// Don't send /low-priority: blocked agents wait for the reset.
+    #[arg(long = "no-low-priority")]
+    no_low_priority: bool,
+
     /// statusLine hook for Claude Code: receives JSON on stdin and stores
     /// it in statusline_json_path (the guard reads it afterwards).
     #[arg(long)]
@@ -507,7 +544,8 @@ struct Cli {
     #[arg(long, value_name = "BIN")]
     herdr: Option<String>,
 
-    /// Named herdr session (passed as HERDR_SESSION). "null" removes it.
+    /// Pin ONE named herdr session (passed as HERDR_SESSION). "null"
+    /// removes the pin: every running herdr session is watched (default).
     #[arg(long, value_name = "NAME")]
     session: Option<String>,
 
@@ -685,7 +723,7 @@ async fn main() -> Result<()> {
         let config = load_config_from(&config_path)?;
         let targets = resolve_wake_targets(&config).await?;
         for t in &targets {
-            println!("{t}");
+            println!("{}", t.key());
         }
         return Ok(());
     }
@@ -695,7 +733,7 @@ async fn main() -> Result<()> {
         let config = load_config_from(&config_path)?;
         let agents = list_kind_agents(&config).await?;
         for a in &agents {
-            println!("{a}");
+            println!("{}", a.key());
         }
         return Ok(());
     }
@@ -709,7 +747,7 @@ async fn main() -> Result<()> {
             Ok(t) => t,
             Err(_) => Vec::new(),
         };
-        let blocked: Vec<String> = if info.hard_limit_hit {
+        let blocked: Vec<Target> = if info.hard_limit_hit {
             // Global quota block: every target is blocked.
             targets
         } else {
@@ -726,7 +764,7 @@ async fn main() -> Result<()> {
             println!("0");
         } else {
             for t in &blocked {
-                println!("{t}");
+                println!("{}", t.key());
             }
         }
         return Ok(());
@@ -956,13 +994,13 @@ async fn run_once(
                 // on the next cycle.
                 match resolve_wake_targets(config).await {
                     Ok(all_targets) => {
-                        let targets: Vec<String> = all_targets
+                        let targets: Vec<Target> = all_targets
                             .into_iter()
-                            .filter(|t| !pause.agents.contains(t))
+                            .filter(|t| !t.is_paused(&pause))
                             .collect();
                         let pending = targets
                             .iter()
-                            .any(|t| state.woken_targets.get(t) != Some(&reset_at));
+                            .any(|t| state.woken_targets.get(&t.key()) != Some(&reset_at));
                         if pending {
                             debug!("Resume still pending for targets of this window");
                             return Ok(Action::SleepUntil(reset_at));
@@ -1009,7 +1047,22 @@ async fn run_once(
                 }
                 return Ok(Action::SleepUntil(reset_at));
             }
+            // Still inside the blocked window: don't let the fleet freeze.
+            // Every claude agent sitting on the "Usage limit reached"
+            // screen gets /low-priority so it keeps working right now at
+            // lower priority; the ones already in that mode are left alone.
+            if config.low_priority {
+                if let Err(e) = low_priority_pass(config, state, reset_at, &pause, dry_run).await {
+                    warn!("Low-priority pass: {:#}", e);
+                }
+            }
             if remaining > (config.warning_lead_time_secs as i64) {
+                if config.low_priority {
+                    // Keep polling: agents that hit the screen later (or a
+                    // new session) must get the command too, and a sent
+                    // command is verified on the next pass.
+                    return Ok(Action::SleepSeconds(config.poll_interval_secs.max(5)));
+                }
                 // Hard limit detected EARLY (the JSON showed 99.9 with the
                 // window far away): sleep ONLY until the warning window
                 // starts, to arrive awake and inject on time.
@@ -1121,16 +1174,16 @@ async fn inject_delegation_prompt(
 
     let pause = load_pause_state(&pause_path());
     let all_targets = resolve_wake_targets(config).await?;
-    let targets: Vec<String> = all_targets
+    let targets: Vec<Target> = all_targets
         .into_iter()
-        .filter(|t| !pause.agents.contains(t))
+        .filter(|t| !t.is_paused(&pause))
         .collect();
     let mut all_injected = true;
 
     for t in &targets {
         if state
             .injected_targets
-            .get(t)
+            .get(&t.key())
             .is_some_and(|&r| (reset_at - r).abs() <= 120)
         {
             debug!("'{}' already injected for window {}", t, reset_at);
@@ -1189,7 +1242,7 @@ async fn inject_delegation_prompt(
         };
 
         if ok {
-            state.injected_targets.insert(t.clone(), reset_at);
+            state.injected_targets.insert(t.key(), reset_at);
         } else {
             all_injected = false;
         }
@@ -1303,6 +1356,121 @@ struct HerdrAgentEntry {
     kind: Option<String>,
 }
 
+/// A herdr session reachable from this daemon (`herdr session list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HerdrSession {
+    /// None = herdr's default session (no HERDR_SESSION needed).
+    name: Option<String>,
+    /// The session socket, when known: the unambiguous way to address it.
+    socket: Option<PathBuf>,
+}
+
+impl HerdrSession {
+    fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or("default")
+    }
+}
+
+/// An agent to wake: which pane/name, inside which herdr session. Agents
+/// live in sessions, so the same pane id can exist in two sessions; the
+/// key ("name@session") is what state files and pause lists refer to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Target {
+    id: String,
+    session: Option<String>,
+    socket: Option<PathBuf>,
+}
+
+impl Target {
+    fn key(&self) -> String {
+        match &self.session {
+            Some(s) => format!("{}@{}", self.id, s),
+            None => self.id.clone(),
+        }
+    }
+
+    /// A pause entry may name the agent bare ("w1:p1A") or fully
+    /// qualified ("w1:p1A@super"); both pause this target.
+    fn is_paused(&self, pause: &PauseState) -> bool {
+        pause.agents.iter().any(|p| p == &self.id || *p == self.key())
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.key())
+    }
+}
+
+/// Running sessions from `herdr session list --json`; the default session
+/// is addressed by socket only (no HERDR_SESSION).
+fn parse_session_list(v: &Value) -> Vec<HerdrSession> {
+    v.pointer("/sessions")
+        .or_else(|| v.pointer("/result/sessions"))
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|s| s.get("running").and_then(|r| r.as_bool()).unwrap_or(false))
+                .filter_map(|s| {
+                    let name = s.get("name").and_then(|x| x.as_str())?.to_string();
+                    let is_default = s.get("default").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let socket = s
+                        .get("socket_path")
+                        .and_then(|x| x.as_str())
+                        .map(PathBuf::from);
+                    Some(HerdrSession {
+                        name: if is_default { None } else { Some(name) },
+                        socket,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The sessions the guard works on: the pinned `herdr_session` if set,
+/// otherwise EVERY running herdr session. If herdr can't list sessions
+/// (older herdr, monolithic mode) the default session is used.
+async fn running_sessions(config: &Config) -> Vec<HerdrSession> {
+    if let Some(name) = &config.herdr_session {
+        return vec![HerdrSession {
+            name: Some(name.clone()),
+            socket: None,
+        }];
+    }
+    let fallback = vec![HerdrSession {
+        name: None,
+        socket: None,
+    }];
+    let output = herdr_command_in(config, None, None)
+        .args(["session", "list", "--json"])
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let v: Value = serde_json::from_slice(&o.stdout).unwrap_or(Value::Null);
+            let sessions = parse_session_list(&v);
+            if sessions.is_empty() {
+                debug!("herdr lists no running session: using the default one");
+                fallback
+            } else {
+                sessions
+            }
+        }
+        Ok(o) => {
+            debug!(
+                "'herdr session list' failed ({}): using the default session",
+                herdr_error_message(&o.stderr)
+            );
+            fallback
+        }
+        Err(e) => {
+            debug!("'herdr session list' could not run ({e}): using the default session");
+            fallback
+        }
+    }
+}
+
 /// Resolves the herdr binary to invoke: if `herdr_bin` is a path
 /// (absolute or with /), it is used as-is. If it is just a name, it is
 /// looked up first in ~/.local/bin (user systemd services run with
@@ -1322,12 +1490,27 @@ fn herdr_bin_resolved(config: &Config) -> PathBuf {
     bin.to_path_buf()
 }
 
-fn herdr_command(config: &Config) -> Command {
+/// herdr invocation addressed to one session. The daemon's own
+/// environment (it may have been started from inside a herdr pane) must
+/// never leak HERDR_SESSION/HERDR_SOCKET_PATH into a call meant for
+/// another session, so both are cleared before the explicit ones are set.
+fn herdr_command_in(config: &Config, session: Option<&str>, socket: Option<&Path>) -> Command {
     let mut cmd = Command::new(herdr_bin_resolved(config));
-    if let Some(session) = &config.herdr_session {
-        cmd.env("HERDR_SESSION", session);
+    if session.is_some() || socket.is_some() {
+        cmd.env_remove("HERDR_SESSION");
+        cmd.env_remove("HERDR_SOCKET_PATH");
+    }
+    if let Some(s) = session {
+        cmd.env("HERDR_SESSION", s);
+    }
+    if let Some(p) = socket {
+        cmd.env("HERDR_SOCKET_PATH", p);
     }
     cmd
+}
+
+fn herdr_command_for(config: &Config, target: &Target) -> Command {
+    herdr_command_in(config, target.session.as_deref(), target.socket.as_deref())
 }
 
 fn herdr_error_message(stderr: &[u8]) -> String {
@@ -1388,78 +1571,115 @@ fn parse_agent_list(v: &Value) -> Vec<HerdrAgentEntry> {
 /// in the config, only that one is shown; otherwise every alive
 /// kind=`herdr_agent_kind` agent from `herdr agent list` is a target.
 /// Zero matches is an explicit error, not a guess.
-async fn resolve_targets(config: &Config) -> Result<Vec<String>> {
+async fn resolve_targets(config: &Config) -> Result<Vec<Target>> {
     if let Some(explicit) = &config.herdr_agent_target {
-        return Ok(vec![explicit.clone()]);
+        return Ok(vec![pinned_target(config, explicit).await]);
     }
     auto_detect_targets(config).await
 }
 
-/// Autodetects every alive agent of `herdr_agent_kind` via `herdr agent list`.
-/// NO pin here: this is the set that gets resumed/delegated.
-async fn auto_detect_targets(config: &Config) -> Result<Vec<String>> {
-    let output = herdr_command(config)
-        .args(["agent", "list"])
-        .output()
-        .await
-        .context("running 'herdr agent list' (is herdr in PATH and the server up?)")?;
-
-    if !output.status.success() {
-        bail!(
-            "'herdr agent list' failed: {}",
-            herdr_error_message(&output.stderr)
-        );
+/// The pinned agent as a Target: looked up across the running sessions
+/// (so "w1:p1A" finds its session); if it isn't listed, it is addressed
+/// in the pinned/default session as-is.
+async fn pinned_target(config: &Config, pin: &str) -> Target {
+    if let Ok(all) = list_agents_everywhere(config).await {
+        if let Some((s, _)) = all.iter().find(|(_, a)| a.target == pin) {
+            return Target {
+                id: pin.to_string(),
+                session: s.name.clone(),
+                socket: s.socket.clone(),
+            };
+        }
     }
-
-    let v: Value =
-        serde_json::from_slice(&output.stdout).context("parsing 'herdr agent list' JSON")?;
-    let agents = parse_agent_list(&v);
-
-    let matches: Vec<String> = agents
-        .iter()
-        .filter(|a| a.kind.as_deref() == Some(config.herdr_agent_kind.as_str()))
-        .map(|a| a.target.clone())
-        .collect();
-
-    match matches.as_slice() {
-        [] => bail!(
-            "No kind='{}' agent found alive in herdr. Seen: {:?}. \
-             Set clari's herdr_agent_target if the detected kind is off.",
-            config.herdr_agent_kind,
-            agents
-                .iter()
-                .map(|a| format!("{}({})", a.target, a.kind.as_deref().unwrap_or("?")))
-                .collect::<Vec<_>>()
-        ),
-        // Note: we return ALL the matches (multi-target), not just one.
-        all => Ok(all.to_vec()),
+    Target {
+        id: pin.to_string(),
+        session: config.herdr_session.clone(),
+        socket: None,
     }
 }
 
-/// Lists every alive `herdr_agent_kind` agent via `herdr agent list`.
-/// Unlike `auto_detect_targets`, an empty match is a valid result (returns
-/// [] instead of bailing), which is what `--list` wants.
-async fn list_kind_agents(config: &Config) -> Result<Vec<String>> {
-    let output = herdr_command(config)
-        .args(["agent", "list"])
-        .output()
-        .await
-        .context("running 'herdr agent list'")?;
-
-    if !output.status.success() {
+/// `herdr agent list` in EVERY running session (or the pinned one).
+/// A session that fails is reported and skipped; it is an error only when
+/// no session answered at all.
+async fn list_agents_everywhere(config: &Config) -> Result<Vec<(HerdrSession, HerdrAgentEntry)>> {
+    let sessions = running_sessions(config).await;
+    let mut all = Vec::new();
+    let mut errors = Vec::new();
+    for s in &sessions {
+        let output = herdr_command_in(config, s.name.as_deref(), s.socket.as_deref())
+            .args(["agent", "list"])
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => match serde_json::from_slice::<Value>(&o.stdout) {
+                Ok(v) => {
+                    for a in parse_agent_list(&v) {
+                        all.push((s.clone(), a));
+                    }
+                }
+                Err(e) => errors.push(format!("{}: parsing 'herdr agent list' JSON: {e}", s.label())),
+            },
+            Ok(o) => errors.push(format!("{}: {}", s.label(), herdr_error_message(&o.stderr))),
+            Err(e) => errors.push(format!(
+                "{}: running 'herdr agent list' (is herdr in PATH and the server up?): {e}",
+                s.label()
+            )),
+        }
+    }
+    if !errors.is_empty() && errors.len() == sessions.len() {
         bail!(
-            "'herdr agent list' failed: {}",
-            herdr_error_message(&output.stderr)
+            "'herdr agent list' failed in every session: {}",
+            errors.join(" | ")
         );
     }
+    for e in errors {
+        warn!("'herdr agent list' failed in session {}", e);
+    }
+    Ok(all)
+}
 
-    let v: Value =
-        serde_json::from_slice(&output.stdout).context("parsing 'herdr agent list' JSON")?;
-    Ok(parse_agent_list(&v)
-        .iter()
-        .filter(|a| a.kind.as_deref() == Some(config.herdr_agent_kind.as_str()))
-        .map(|a| a.target.clone())
-        .collect())
+fn kind_targets(config: &Config, all: &[(HerdrSession, HerdrAgentEntry)]) -> Vec<Target> {
+    all.iter()
+        .filter(|(_, a)| a.kind.as_deref() == Some(config.herdr_agent_kind.as_str()))
+        .map(|(s, a)| Target {
+            id: a.target.clone(),
+            session: s.name.clone(),
+            socket: s.socket.clone(),
+        })
+        .collect()
+}
+
+/// Autodetects every alive agent of `herdr_agent_kind` in every running
+/// herdr session. NO pin here: this is the set that gets resumed/delegated.
+async fn auto_detect_targets(config: &Config) -> Result<Vec<Target>> {
+    let all = list_agents_everywhere(config).await?;
+    let matches = kind_targets(config, &all);
+
+    if matches.is_empty() {
+        bail!(
+            "No kind='{}' agent found alive in herdr. Seen: {:?}. \
+             Set clari's herdr_agent_target if the detected kind is off.",
+            config.herdr_agent_kind,
+            all.iter()
+                .map(|(s, a)| format!(
+                    "{}@{}({})",
+                    a.target,
+                    s.label(),
+                    a.kind.as_deref().unwrap_or("?")
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Note: ALL the matches (multi-target, multi-session), not just one.
+    Ok(matches)
+}
+
+/// Lists every alive `herdr_agent_kind` agent across sessions. Unlike
+/// `auto_detect_targets`, an empty match is a valid result (returns []
+/// instead of bailing), which is what `--list` wants.
+async fn list_kind_agents(config: &Config) -> Result<Vec<Target>> {
+    let all = list_agents_everywhere(config).await?;
+    Ok(kind_targets(config, &all))
 }
 
 /// Checks whether the `max_devs` budget limit allows waking more agents.
@@ -1531,10 +1751,10 @@ fn agent_is_blocked(status: &str) -> bool {
 /// only the pinned `herdr_agent_target` is used (or the first detected).
 /// If listing fails and a pin exists, fall back to the pin so the pinned
 /// agent is never skipped.
-async fn resolve_wake_targets(config: &Config) -> Result<Vec<String>> {
+async fn resolve_wake_targets(config: &Config) -> Result<Vec<Target>> {
     if !config.resume_all {
         if let Some(explicit) = &config.herdr_agent_target {
-            return Ok(vec![explicit.clone()]);
+            return Ok(vec![pinned_target(config, explicit).await]);
         }
     }
     match auto_detect_targets(config).await {
@@ -1545,12 +1765,196 @@ async fn resolve_wake_targets(config: &Config) -> Result<Vec<String>> {
                     "herdr agent list failed ({:#}); falling back to the pinned target '{}'",
                     e, pin
                 );
-                Ok(vec![pin.clone()])
+                Ok(vec![Target {
+                    id: pin.clone(),
+                    session: config.herdr_session.clone(),
+                    socket: None,
+                }])
             } else {
                 Err(e)
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────
+// Low priority: keep blocked agents working during the block
+// ─────────────────────────────────────────────
+
+/// What a claude pane's visible screen says about the limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitScreen {
+    /// "Lower priority until ..." — already working at lower priority.
+    LowPriorityActive,
+    /// Lower-priority mode ended / allowance used / not offered: nothing
+    /// clari can do, the agent waits for the reset.
+    LowPriorityUnavailable,
+    /// "Usage limit reached" and NOT in lower-priority mode: send it.
+    LimitReached,
+    /// "Your usage limit has reset · press enter to continue".
+    LimitReset,
+    /// Not on the limit screen (working, idle, whatever).
+    Other,
+}
+
+/// Classifies the visible screen of a claude pane. The bottom lines win:
+/// Claude Code pins the current limit status right above the input box,
+/// while older banners scroll up, so the scan runs bottom-up and stops at
+/// the first line that speaks about the limit.
+fn classify_limit_screen(screen: &str) -> LimitScreen {
+    const ACTIVE: &[&str] = &[
+        "Lower priority until",
+        "Working at lower priority",
+        "Continuing now at lower priority",
+        "Lower-priority mode is back on",
+    ];
+    const UNAVAILABLE: &[&str] = &[
+        "lower-priority allowance",
+        "Lower-priority mode ended",
+        "lower-priority mode ended",
+        "lower-priority mode stopped",
+        "Lower-priority mode is no longer available",
+        "Lower-priority mode isn't available",
+        "Lower-priority mode is taking a break",
+    ];
+    for raw in screen.lines().rev() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if ACTIVE.iter().any(|m| line.contains(m)) {
+            return LimitScreen::LowPriorityActive;
+        }
+        if UNAVAILABLE.iter().any(|m| line.contains(m)) {
+            return LimitScreen::LowPriorityUnavailable;
+        }
+        if line.contains("Your usage limit has reset") {
+            return LimitScreen::LimitReset;
+        }
+        if line.contains("Usage limit reached") {
+            return LimitScreen::LimitReached;
+        }
+    }
+    LimitScreen::Other
+}
+
+/// Minimum spacing between two `/low-priority` sends to the same agent:
+/// the command is a toggle, so a second send before the first one has
+/// been observed on screen would turn the mode back OFF.
+const LOW_PRIORITY_RETRY_SECS: i64 = 60;
+
+/// The visible screen of an agent's pane as plain text.
+async fn read_agent_screen(config: &Config, target: &Target) -> Result<String> {
+    let output = herdr_command_for(config, target)
+        .args([
+            "agent", "read", &target.id, "--source", "visible", "--format", "text",
+        ])
+        .output()
+        .await
+        .with_context(|| format!("running 'herdr agent read {}'", target))?;
+    if !output.status.success() {
+        bail!(
+            "'herdr agent read {}' failed: {}",
+            target,
+            herdr_error_message(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// One pass over every claude agent, in every session, while the hard
+/// limit is active: the ones stuck on "Usage limit reached" get the
+/// `/low-priority` command (once, verified on the next pass by reading the
+/// screen again); the ones already at lower priority are recorded and left
+/// alone; the ones for which the mode is unavailable are recorded so they
+/// are not poked again this window.
+async fn low_priority_pass(
+    config: &Config,
+    state: &mut GuardState,
+    reset_at: i64,
+    pause: &PauseState,
+    dry_run: bool,
+) -> Result<()> {
+    let targets: Vec<Target> = resolve_wake_targets(config)
+        .await?
+        .into_iter()
+        .filter(|t| !t.is_paused(pause))
+        .collect();
+    let now = Utc::now().timestamp();
+    let cmd = config.low_priority_command.trim();
+    let mut changed = false;
+
+    for t in &targets {
+        let key = t.key();
+        if state.low_priority_targets.get(&key) == Some(&reset_at) {
+            continue;
+        }
+        let screen = match read_agent_screen(config, t).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Could not read the screen of '{}': {:#}", t, e);
+                continue;
+            }
+        };
+        match classify_limit_screen(&screen) {
+            LimitScreen::LowPriorityActive => {
+                info!(
+                    "'{}' is working at lower priority (window {}) — leaving it alone",
+                    t, reset_at
+                );
+                state.low_priority_targets.insert(key, reset_at);
+                changed = true;
+            }
+            LimitScreen::LowPriorityUnavailable => {
+                warn!(
+                    "'{}': lower-priority mode is not available (allowance used up or \
+                     mode ended) — it waits for the reset at {}",
+                    t, reset_at
+                );
+                state.low_priority_targets.insert(key, reset_at);
+                changed = true;
+            }
+            LimitScreen::LimitReset => {
+                debug!("'{}' already shows the limit reset — the resume path handles it", t);
+            }
+            LimitScreen::Other => {
+                debug!("'{}' is not on the limit screen — nothing to do", t);
+            }
+            LimitScreen::LimitReached => {
+                if let Some(last) = state.low_priority_attempts.get(&key) {
+                    if now - last < LOW_PRIORITY_RETRY_SECS {
+                        debug!(
+                            "'{}' got {} {}s ago — waiting for the screen to reflect it",
+                            t,
+                            cmd,
+                            now - last
+                        );
+                        continue;
+                    }
+                }
+                info!(
+                    "'{}' is stuck on 'Usage limit reached' → sending {} so it keeps \
+                     working at lower priority",
+                    t, cmd
+                );
+                state.low_priority_attempts.insert(key.clone(), now);
+                changed = true;
+                if dry_run {
+                    info!("[rehearsal] would send {} to '{}'", cmd, t);
+                    continue;
+                }
+                match send_to_herdr(config, t, cmd, None, Some(15_000)).await {
+                    Ok(_) => info!("'{}': {} sent — verifying on the next pass", t, cmd),
+                    Err(e) => warn!("'{}': sending {} failed: {:#} — will retry", t, cmd, e),
+                }
+            }
+        }
+    }
+
+    if changed {
+        save_state(&config.state_path, state)?;
+    }
+    Ok(())
 }
 
 /// Wakes the herdr targets when the window opens.
@@ -1574,9 +1978,9 @@ async fn resume_targets(
 
     let pause = load_pause_state(&pause_path());
     let all_targets = resolve_wake_targets(config).await?;
-    let targets: Vec<String> = all_targets
+    let targets: Vec<Target> = all_targets
         .into_iter()
-        .filter(|t| !pause.agents.contains(t))
+        .filter(|t| !t.is_paused(&pause))
         .collect();
     info!(
         "Window {} opened: checking {} target(s)",
@@ -1587,7 +1991,7 @@ async fn resume_targets(
     let msg = effective_resume_message(config);
 
     for t in &targets {
-        if state.woken_targets.get(t) == Some(&reset_at) {
+        if state.woken_targets.get(&t.key()) == Some(&reset_at) {
             debug!("'{}' already has resume for this window, skip", t);
             continue;
         }
@@ -1600,7 +2004,7 @@ async fn resume_targets(
         };
 
         if ok {
-            state.woken_targets.insert(t.clone(), reset_at);
+            state.woken_targets.insert(t.key(), reset_at);
         }
     }
 
@@ -1612,7 +2016,7 @@ async fn resume_targets(
 /// `herdr agent prompt --wait --until working` returns
 /// `agent_prompt_stalled` if the input wasn't accepted (stale limit
 /// screen, non-interactive agent), and we treat that as pending.
-async fn wake_agent(config: &Config, target: &str, msg: &str) -> Result<bool> {
+async fn wake_agent(config: &Config, target: &Target, msg: &str) -> Result<bool> {
     match get_agent_status(config, target).await {
         Ok(s) if s == "working" => {
             info!("'{}' is already working — not touching", target);
@@ -1652,13 +2056,13 @@ async fn wake_agent(config: &Config, target: &str, msg: &str) -> Result<bool> {
 /// even while the agent is working.
 async fn send_to_herdr(
     config: &Config,
-    target: &str,
+    target: &Target,
     text: &str,
     wait_until: Option<&[&str]>,
     timeout_ms: Option<u64>,
 ) -> Result<Value> {
-    let mut cmd = herdr_command(config);
-    cmd.args(["agent", "prompt", target, text]);
+    let mut cmd = herdr_command_for(config, target);
+    cmd.args(["agent", "prompt", &target.id, text]);
     if let Some(states) = wait_until {
         cmd.arg("--wait");
         for s in states {
@@ -1685,9 +2089,9 @@ async fn send_to_herdr(
     Ok(serde_json::from_slice(&output.stdout).unwrap_or(Value::Null))
 }
 
-async fn get_agent_status(config: &Config, target: &str) -> Result<String> {
-    let output = herdr_command(config)
-        .args(["agent", "get", target])
+async fn get_agent_status(config: &Config, target: &Target) -> Result<String> {
+    let output = herdr_command_for(config, target)
+        .args(["agent", "get", &target.id])
         .output()
         .await
         .context("running 'herdr agent get'")?;
@@ -1865,6 +2269,15 @@ fn collect_settings(cli: &Cli) -> Result<Vec<(String, Option<toml::Value>)>> {
     }
     if cli.no_all {
         s.push(("resume_all".into(), Some(toml::Value::Boolean(false))));
+    }
+    if cli.low_priority && cli.no_low_priority {
+        bail!("--low-priority and --no-low-priority are mutually exclusive");
+    }
+    if cli.low_priority {
+        s.push(("low_priority".into(), Some(toml::Value::Boolean(true))));
+    }
+    if cli.no_low_priority {
+        s.push(("low_priority".into(), Some(toml::Value::Boolean(false))));
     }
     if let Some(v) = cli.poll {
         s.push((
@@ -2625,6 +3038,21 @@ async fn print_full_status(config: &Config) -> Result<()> {
             painted("disabled (default)", RED)
         }
     );
+    println!(
+        "{:<15}: {}",
+        "low_priority",
+        if config.low_priority {
+            painted(
+                &format!(
+                    "enabled — {} to agents stuck on the limit screen (default)",
+                    config.low_priority_command
+                ),
+                GREEN,
+            )
+        } else {
+            painted("disabled (--no-low-priority): blocked agents wait for the reset", YELLOW)
+        }
+    );
     let limits = load_limites();
     println!(
         "{:<15}: {}",
@@ -2668,9 +3096,33 @@ async fn print_full_status(config: &Config) -> Result<()> {
             painted("only the pinned herdr_agent_target (--no-all)", YELLOW)
         }
     );
+    let sessions = running_sessions(config).await;
+    println!(
+        "{:<15}: {}",
+        "herdr_sessions",
+        if config.herdr_session.is_some() {
+            painted(
+                &format!("pinned to '{}' (--session null to watch all)", sessions[0].label()),
+                YELLOW,
+            )
+        } else {
+            painted(
+                &format!(
+                    "ALL running ({}): {}",
+                    sessions.len(),
+                    sessions.iter().map(|s| s.label().to_string()).collect::<Vec<_>>().join(", ")
+                ),
+                GREEN,
+            )
+        }
+    );
     match resolve_targets(config).await {
         Ok(targets) => {
-            println!("{:<15}: {}", "herdr_targets", targets.join(", "));
+            println!(
+                "{:<15}: {}",
+                "herdr_targets",
+                targets.iter().map(|t| t.key()).collect::<Vec<_>>().join(", ")
+            );
             for t in &targets {
                 match get_agent_status(config, t).await {
                     Ok(status) => {
@@ -2914,6 +3366,96 @@ mod tests {
         assert!(!p.global);
         assert!(p.agents.is_empty());
     }
+
+    #[test]
+    fn limit_screen_detects_the_stuck_state() {
+        let screen = "some output\n\n  Usage limit reached · resets 2:20am · /low-priority to continue now at lower priority · uses your weekly limit\n\n  ❯ \n";
+        assert_eq!(classify_limit_screen(screen), LimitScreen::LimitReached);
+        let armed = "  Usage limit reached · continuing automatically at 2:20am · esc to cancel\n";
+        assert_eq!(classify_limit_screen(armed), LimitScreen::LimitReached);
+    }
+
+    #[test]
+    fn limit_screen_leaves_lower_priority_alone() {
+        // The pinned status line is the LAST word: an older "Usage limit
+        // reached" banner higher up must not trigger a second (toggling) send.
+        let screen = "  Usage limit reached\n\n  ⚠ Lower priority until 2:20am · 28% allowance left · /low-priority to stop\n\n  ⏵⏵ bypass permissions on\n";
+        assert_eq!(classify_limit_screen(screen), LimitScreen::LowPriorityActive);
+        let just_sent = "Continuing now at lower priority until your limit resets at 2:20am. Your weekly limit still applies...\n";
+        assert_eq!(classify_limit_screen(just_sent), LimitScreen::LowPriorityActive);
+    }
+
+    #[test]
+    fn limit_screen_knows_when_the_mode_is_unavailable() {
+        for s in [
+            "You've used this week's lower-priority allowance. Lower-priority mode is offered again after your weekly limit resets.",
+            "Lower-priority mode ended · you have reached your weekly usage limit",
+            "No room for lower-priority work for a while · lower-priority mode stopped; new messages wait for your usage limit to reset",
+            "Lower-priority mode isn't available right now.",
+        ] {
+            assert_eq!(classify_limit_screen(s), LimitScreen::LowPriorityUnavailable, "{s}");
+        }
+    }
+
+    #[test]
+    fn limit_screen_other_states() {
+        assert_eq!(
+            classify_limit_screen("Your usage limit has reset · press enter to continue"),
+            LimitScreen::LimitReset
+        );
+        assert_eq!(classify_limit_screen("✻ Thinking… (3s)\n❯ "), LimitScreen::Other);
+        // "Lower-priority mode is off" = the user turned it off: never fight them.
+        assert_eq!(
+            classify_limit_screen("Lower-priority mode is off. New messages wait for your usage limit as usual."),
+            LimitScreen::Other
+        );
+    }
+
+    #[test]
+    fn session_list_keeps_only_running_sessions_and_default_has_no_name() {
+        let v: Value = serde_json::from_str(
+            r#"{"sessions":[
+                {"default":true,"name":"default","running":true,"socket_path":"/h/.config/herdr/herdr.sock"},
+                {"default":false,"name":"jefe","running":false,"socket_path":"/h/.config/herdr/sessions/jefe/herdr.sock"},
+                {"default":false,"name":"super","running":true,"socket_path":"/h/.config/herdr/sessions/super/herdr.sock"}
+            ]}"#,
+        )
+        .unwrap();
+        let s = parse_session_list(&v);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].name, None);
+        assert_eq!(s[0].socket.as_deref(), Some(Path::new("/h/.config/herdr/herdr.sock")));
+        assert_eq!(s[1].name.as_deref(), Some("super"));
+        assert_eq!(s[1].label(), "super");
+        assert_eq!(s[0].label(), "default");
+    }
+
+    #[test]
+    fn target_key_and_pause_matching() {
+        let t = Target { id: "w1:p1A".into(), session: Some("super".into()), socket: None };
+        assert_eq!(t.key(), "w1:p1A@super");
+        assert_eq!(t.to_string(), "w1:p1A@super");
+        let bare = Target { id: "w1:p1A".into(), session: None, socket: None };
+        assert_eq!(bare.key(), "w1:p1A");
+        let by_id = PauseState { global: false, agents: vec!["w1:p1A".into()] };
+        let by_key = PauseState { global: false, agents: vec!["w1:p1A@super".into()] };
+        let other = PauseState { global: false, agents: vec!["w1:p1A@jefe".into()] };
+        assert!(t.is_paused(&by_id));
+        assert!(t.is_paused(&by_key));
+        assert!(!t.is_paused(&other));
+    }
+
+    #[test]
+    fn low_priority_is_on_by_default_and_the_flag_turns_it_off() {
+        let cfg = Config::default();
+        assert!(cfg.low_priority);
+        assert_eq!(cfg.low_priority_command, "/low-priority");
+        let cli = Cli::parse_from(["clari", "--no-low-priority"]);
+        let s = collect_settings(&cli).unwrap();
+        assert_eq!(s, vec![("low_priority".to_string(), Some(toml::Value::Boolean(false)))]);
+        let cli = Cli::parse_from(["clari", "-L"]);
+        let s = collect_settings(&cli).unwrap();
+        assert_eq!(s, vec![("low_priority".to_string(), Some(toml::Value::Boolean(true)))]);
+        assert!(collect_settings(&Cli::parse_from(["clari", "-L", "--no-low-priority"])).is_err());
+    }
 }
-
-

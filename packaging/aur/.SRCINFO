@@ -1,6 +1,6 @@
 pkgbase = clari
-	pkgdesc = Claude Code quota guard: JSON statusLine hook + auto-resume over herdr (no tmux)
-	pkgver = 0.4.1
+	pkgdesc = Claude Code quota guard: JSON statusLine hook + auto-resume over herdr
+	pkgver = 0.6.0
 	pkgrel = 1
 	url = https://github.com/luismaf/clari
 	arch = x86_64
@@ -8,7 +8,7 @@ pkgbase = clari
 	license = MIT
 	makedepends = cargo
 	depends = glibc
-	source = clari-0.4.1.tar.gz::https://github.com/luismaf/clari/archive/refs/tags/v0.4.1.tar.gz
+	source = clari-0.6.0.tar.gz::https://github.com/luismaf/clari/archive/refs/tags/v0.6.0.tar.gz
 	sha256sums = SKIP
 
 pkgname = clari
