@@ -421,6 +421,17 @@ else
     fi
 fi
 
+# ── 4. Upgrade in place: a running clari service keeps the OLD binary in
+#      memory until restarted. Restart it only if it is already active.
+if [ "$DRY" != "1" ] && command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-active --quiet clari.service 2>/dev/null; then
+    if systemctl --user restart clari.service 2>/dev/null; then
+        echo "✓ clari.service restarted with the new version"
+    else
+        echo "⚠  could not restart clari.service — run: systemctl --user restart clari.service"
+    fi
+fi
+
 echo
 echo "Try it:        clari -s"
 echo "Background:    clari            (installs + starts the systemd user service)"
